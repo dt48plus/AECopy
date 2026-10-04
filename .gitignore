@@ -1,0 +1,8 @@
+# Runtime (mailbox, logs, clipboard) and generated files
+mailbox/
+AECopy_startup.jsx
+AECopy.exe
+AECopy_tmp.exe
+*.zip
+# Local test scripts and media (paths specific to the author's machine)
+tests/
