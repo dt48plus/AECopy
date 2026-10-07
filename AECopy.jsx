@@ -1,12 +1,11 @@
 // Author: Ilhan Turan - https://ilhanturan.fr
-// AECopy v1.0.0 - Ctrl+C / Ctrl+V between several After Effects (2020 to 2026).
+// AECopy v1.1.0 - Ctrl+C / Ctrl+V between several After Effects (2020 to 2026).
 //
-// Charge au demarrage de chaque After Effects (AECopy_startup.jsx dans le dossier
-// Scripts\Startup de l'utilisateur), ou a la main : Fichier > Scripts > Executer le fichier de script.
-// L'application AECopy.exe depose des commandes dans AECopy\mailbox :
-//   mark   (Ctrl+C)  : retient ce qui est selectionne, sans rien serialiser
-//   export (Ctrl+V dans un AUTRE After Effects) : ecrit la selection retenue dans clipboard.json
-//   paste             : reconstruit clipboard.json dans ce After Effects
+// Charge par l'extension invisible AECopy (dossier cep\, installee par AECopy.exe dans les extensions Adobe).
+// Pas de tache de fond dans After Effects : l'extension surveille la boite aux lettres et appelle poll() a
+// l'arrivee d'une commande. L'application AECopy.exe depose ses commandes dans mailbox\cmd_<pid>.txt :
+//   copy / copystyles (Ctrl+C) : ecrit la selection dans clipboard.json
+//   paste, pastefit, dragpaste, dragpastefit, pasteimage : reconstruit dans ce After Effects
 // ExtendScript ES3 : pas de JSON natif, pas d'Array.indexOf.
 
 (function () {
@@ -21,7 +20,10 @@
     }
 
     var X = $.global.AECOPY = {};
-    X.VERSION = "1.0.0";
+    X.VERSION = "1.1.0";
+    // Date du fichier charge (ms) : renvoyee par ping, l'appli sait si un Reload a bien pris.
+    X.STAMP = 0;
+    try { X.STAMP = (new File($.fileName)).modified.getTime(); } catch (eStamp) {}
     X.running = false;
     X.HOME = $.global.AECOPY_HOME || (new File($.fileName)).parent.fsName;
     // Hors d'AppData : un programme lance depuis une appli empaquetee (MSIX) y ecrit dans une copie redirigee.
@@ -125,9 +127,99 @@
         return "{" + parts.join(",") + "}";
     }
 
+    // Lecture JSON stricte, sans eval : clipboard.json est un fichier du disque, son contenu ne doit
+    // jamais pouvoir s'executer. Chaines lues par indexOf (une regex sur une longue chaine fait
+    // deborder la pile d'ExtendScript).
+    var JSON_ESC = { "\"": "\"", "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t" };
+    var JSON_NUM = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+\-]?\d+)?/g;
+
+    function parseJSON(s) {
+        var i = 0, n = s.length;
+        function fail(what) { throw new Error("unreadable clipboard (" + what + " at " + i + ")"); }
+        function ws() {
+            var c;
+            while (i < n && ((c = s.charCodeAt(i)) === 32 || c === 10 || c === 13 || c === 9)) i++;
+        }
+        function plain(a, b) {
+            var t = s.substring(a, b);
+            if (/[\x00-\x1f]/.test(t)) fail("control character in string");
+            return t;
+        }
+        function str() {
+            i++; // guillemet ouvrant
+            var out = [], start = i;
+            for (;;) {
+                var q = s.indexOf("\"", i), b = s.indexOf("\\", i);
+                if (q < 0) fail("unterminated string");
+                if (b < 0 || b > q) { out.push(plain(start, q)); i = q + 1; return out.join(""); }
+                out.push(plain(start, b));
+                var e = s.charAt(b + 1);
+                if (e === "u") {
+                    var hex = s.substr(b + 2, 4);
+                    if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail("bad \\u escape");
+                    out.push(String.fromCharCode(parseInt(hex, 16)));
+                    i = start = b + 6;
+                } else {
+                    if (!JSON_ESC.hasOwnProperty(e)) fail("bad escape");
+                    out.push(JSON_ESC[e]);
+                    i = start = b + 2;
+                }
+            }
+        }
+        function value() {
+            ws();
+            var c = s.charAt(i);
+            if (c === "{") {
+                i++;
+                var o = {};
+                ws();
+                if (s.charAt(i) === "}") { i++; return o; }
+                for (;;) {
+                    ws();
+                    if (s.charAt(i) !== "\"") fail("key expected");
+                    var k = str();
+                    ws();
+                    if (s.charAt(i++) !== ":") fail("':' expected");
+                    var v = value();
+                    if (k !== "__proto__") o[k] = v;
+                    ws();
+                    c = s.charAt(i++);
+                    if (c === "}") return o;
+                    if (c !== ",") fail("',' or '}' expected");
+                }
+            }
+            if (c === "[") {
+                i++;
+                var a = [];
+                ws();
+                if (s.charAt(i) === "]") { i++; return a; }
+                for (;;) {
+                    a.push(value());
+                    ws();
+                    c = s.charAt(i++);
+                    if (c === "]") return a;
+                    if (c !== ",") fail("',' or ']' expected");
+                }
+            }
+            if (c === "\"") return str();
+            if (s.substr(i, 4) === "true") { i += 4; return true; }
+            if (s.substr(i, 5) === "false") { i += 5; return false; }
+            if (s.substr(i, 4) === "null") { i += 4; return null; }
+            JSON_NUM.lastIndex = i;
+            var m = JSON_NUM.exec(s);
+            if (!m || m.index !== i) fail("unexpected character");
+            i += m[0].length;
+            return +m[0];
+        }
+        var r = value();
+        ws();
+        if (i !== n) fail("extra text");
+        return r;
+    }
+
     function fromJSON(s) {
         if (!s || !/^\s*\{/.test(s)) throw new Error("unreadable clipboard");
-        return eval("(" + s + ")");
+        return parseJSON(s);
     }
 
     // ------------------------------------------------------------------ outils AE
@@ -753,12 +845,9 @@
             } catch (eV) {}
         }
         var sel = app.project.selection;
-        if (it instanceof CompItem && it.selectedLayers.length > 0) {
-            // Comp cliquee dans le panneau Projet apres le dernier choix de calques : c'est la comp qu'on copie.
-            try { trackSelection(); } catch (eT0) {}
-            if (inSelection(it, sel) && (X.projStamp || 0) > (X.selStamp[String(it.id)] || 0)) return "comps";
-            return it;
-        }
+        // Regle : des calques selectionnes dans la comp ouverte = ces calques ; sinon une comp selectionnee dans
+        // le panneau Projet = cette comp ; sinon rien.
+        if (it instanceof CompItem && it.selectedLayers.length > 0) return it;
         if (it instanceof CompItem) return null;
         var cands = [];
         for (var i = 1; i <= app.project.numItems; i++) {
@@ -772,17 +861,61 @@
             names.push(cands[n].name + (st ? " (" + Math.round((new Date().getTime() - st) / 1000) + " s)" : ""));
             if (st > bestStamp) { bestStamp = st; best = cands[n]; }
         }
+        // La comp ou l'on travaille, sans toucher au panneau Projet dans le cas courant : la seule dont la selection
+        // de calques a change depuis le Ctrl+C precedent. En cas de doute (premier Ctrl+C, aucune ou plusieurs
+        // comps changees), la commande Reveal Composition in Project, qui selectionne la comp dans le panneau
+        // Projet le temps de la lire (selection remise ensuite).
+        if (cands.length > 0) {
+            var shown = guessedComp(cands);
+            if (!shown) { shown = revealedComp(); if (shown) log("Ctrl+C: open comp found with Reveal Composition"); }
+
+            if (shown) {
+                var projComps = false;
+                for (var pf = 0; pf < sel.length; pf++) if (sel[pf] instanceof CompItem) projComps = true;
+                var what = null;
+                // Calques selectionnes dans la comp ouverte : ces calques, toujours. Sinon la comp du panneau Projet.
+                // (L'ancienne comparaison des heures de selection se trompait : la recherche de la comp ouverte touche
+                // elle-meme a la selection du panneau Projet, et une 2e copie des memes calques donnait la comp.)
+                if (shown.selectedLayers.length > 0) what = shown;
+                else if (projComps) what = "comps";
+                log("Ctrl+C: activeItem null, comps with selected layers: " + names.join(", ") + " -> open comp " + shown.name +
+                    (what === "comps" ? " (composition selected in the Project panel)" : what ? "" : " (no layer selected)"));
+                return what;
+            }
+        }
         log("Ctrl+C: activeItem " + (it ? it.name : "null") + ", comps with selected layers: " +
             (names.length ? names.join(", ") : "none") + " -> " + (best ? best.name : (cands.length === 1 ? cands[0].name : "?")));
-        // Derniere action dans le panneau Projet (une comp y est selectionnee) : on copie la comp.
-        var projComp = false;
-        for (var pc = 0; pc < sel.length; pc++) if (sel[pc] instanceof CompItem) projComp = true;
-        if (projComp && (X.projStamp || 0) > bestStamp) return "comps";
         // La selection la plus recente l'emporte ; sans historique, la comp aussi selectionnee dans le Projet.
         if (best) return best;
         for (var k = 0; k < cands.length; k++) if (inSelection(cands[k], sel)) return cands[k];
         for (var s = 0; s < sel.length; s++) if (sel[s] instanceof CompItem) return "comps";
         return cands.length === 1 ? cands[0] : null;
+    }
+
+    // Selection de calques de chaque comp au Ctrl+C precedent (id -> signature).
+    X.selCache = null;
+
+    function layerSig(c) {
+        var sl = c.selectedLayers, sig = "";
+        for (var j = 0; j < sl.length; j++) sig += sl[j].index + ",";
+        return sig;
+    }
+
+    function guessedComp(cands) {
+        var first = X.selCache === null;
+        var cache = {}, changed = [];
+        for (var i = 0; i < cands.length; i++) {
+            var key = String(cands[i].id), sig = layerSig(cands[i]);
+            cache[key] = sig;
+            if (!first && X.selCache[key] !== sig) changed.push(cands[i]);
+        }
+        X.selCache = cache;
+        if (cands.length === 1) return cands[0];
+        if (first) return null;
+        // Une seule comp changee : c'est la bonne. Rien de change : ne pas supposer la comp precedente (une autre
+        // comp ou les calques etaient deja selectionnes a pu etre ouverte) -> Reveal Composition.
+        if (changed.length === 1) return changed[0];
+        return null;
     }
 
     // AE 2020 : la commande Reveal Composition in Project selectionne la comp ouverte dans le panneau
@@ -792,6 +925,8 @@
         try { id = app.findMenuCommandId("Reveal Composition in Project"); } catch (eF) {}
         if (!id) return null;
         var keep = plainArray(app.project.selection), found = null;
+        var viewer = null;
+        try { viewer = app.activeViewer; } catch (eV) {}
         try {
             for (var k = 0; k < keep.length; k++) keep[k].selected = false;
             app.executeCommand(id);
@@ -803,7 +938,25 @@
             for (var n = now.length - 1; n >= 0; n--) now[n].selected = false;
             for (var r = 0; r < keep.length; r++) keep[r].selected = true;
         } catch (eR) {}
+        // La commande donne le focus au panneau Projet : un Ctrl+V (ou Suppr) d'After Effects juste apres y
+        // agissait (comp dupliquee au lieu des calques). Focus rendu au visualiseur de composition.
+        try { if (viewer) viewer.setActive(); } catch (eA) {}
+        // After Effects applique parfois la commande apres le script : selection et focus remis encore une fois.
+        X.restoreSel = keep;
+        X.restoreViewer = viewer;
+        try { app.scheduleTask("$.global.AECOPY.restoreSelection()", 50, false); } catch (eS) {}
         return found;
+    }
+
+    X.restoreSelection = function () {
+        try {
+            var now = app.project.selection;
+            for (var n = now.length - 1; n >= 0; n--) now[n].selected = false;
+            for (var r = 0; X.restoreSel && r < X.restoreSel.length; r++) X.restoreSel[r].selected = true;
+            if (X.restoreViewer) X.restoreViewer.setActive();
+        } catch (e) {}
+        X.restoreSel = null;
+        X.restoreViewer = null;
     }
 
     // Comp ou coller : la comp active ; sous AE 2020 (activeItem null) celle ou l'on a travaille en dernier
@@ -844,6 +997,8 @@
         // "comps" : copie de la (des) comp(s) selectionnee(s) dans le panneau Projet.
         var mc = markedComp();
         var it = mc === "comps" ? null : (mc || activeComp());
+        log("Ctrl+C: copying " + (mc === "comps" ? "the composition(s) selected in the Project panel" :
+            (it instanceof CompItem ? it.selectedLayers.length + " selected layer(s) of " + it.name : "nothing")));
         if (it instanceof CompItem && it.selectedLayers.length > 0) {
             var props = [];
             var sel = it.selectedLayers;
@@ -871,7 +1026,6 @@
         var comps = [];
         var ps = app.project.selection;
         for (var c = 0; c < ps.length; c++) if (ps[c] instanceof CompItem) comps.push(ps[c].id);
-        if (!comps.length && it instanceof CompItem) comps.push(it.id);
         if (!comps.length) return "empty";
         X.mark = { kind: "comps", ids: comps };
         return "ok " + comps.length + " composition(s)";
@@ -920,7 +1074,10 @@
                     var q = prop;
                     while (q && q.parentProperty) { chain.unshift(q.matchName); q = q.parentProperty; }
                     var spec = (prop.propertyType === PropertyType.PROPERTY) ? serProp(prop, e.keys) : serGroup(prop, false);
-                    if (spec) pk.props.push({ chain: chain, spec: spec, leaf: prop.propertyType === PropertyType.PROPERTY });
+                    // cs : calque a la taille de la comp (solide, calque d'effets), pour l'option Fit au collage.
+                    var cs = false;
+                    try { cs = layer.source.mainSource instanceof SolidSource && layer.source.width === comp.width && layer.source.height === comp.height; } catch (eCs) {}
+                    if (spec) pk.props.push({ chain: chain, spec: spec, leaf: prop.propertyType === PropertyType.PROPERTY, cs: cs });
                 }
             }
         }
@@ -990,11 +1147,81 @@
         }
     }
 
+    // ---- Adapter a la taille de la comp (option « Fit to comp size ») : comp source W x H, cible W' x H'.
+    // X.fitNow (calque en cours) : sx, sy, pos (Position dans l'espace de la comp ou d'un parent adapte),
+    // layer (calque a la taille de la comp, redimensionne : son espace de calque change aussi), cam.
+    // Tout se fait en mettant les valeurs a l'echelle, axe par axe (origine en haut a gauche des deux cotes).
+    function fitFactor(p) {
+        var F = X.fitNow;
+        if (!F) return null;
+        var mn = p.matchName, parent = p.parentProperty ? p.parentProperty.matchName : "";
+        if (parent === "ADBE Transform Group") {
+            var isPos = mn === "ADBE Position" || mn === "ADBE Position_0" || mn === "ADBE Position_1";
+            var isAnchor = mn === "ADBE Anchor Point";
+            // Point d'interet d'une camera ou d'une lumiere : espace de la comp, comme la position.
+            if (isAnchor && F.cam) isPos = true;
+            if (isPos && !F.pos) return null;
+            if (!isPos && !(isAnchor && F.layer)) return null;
+            if (mn === "ADBE Position_0") return { one: F.sx };
+            if (mn === "ADBE Position_1") return { one: F.sy };
+            return F;
+        }
+        if (!F.layer) return null;
+        var pvt = p.propertyValueType;
+        // Points d'effets (Motion Tile, Lens Flare...) et traces de masques : espace du calque.
+        if (pvt === PVT.TwoD_SPATIAL || pvt === PVT.ThreeD_SPATIAL || (pvt === PVT.SHAPE && mn === "ADBE Mask Shape")) return F;
+        return null;
+    }
+
+    function fitPoint(a, f) {
+        if (!(a instanceof Array)) return a;
+        var out = a.slice(0);
+        if (out.length > 0) out[0] *= f.sx;
+        if (out.length > 1) out[1] *= f.sy;
+        return out;
+    }
+
+    function fitData(d, f) {
+        if (d === null || d === undefined) return d;
+        if (f.one !== undefined) return typeof d === "number" ? d * f.one : d;
+        if (d._sh) {
+            var pts = ["v", "i", "o"];
+            for (var k = 0; k < pts.length; k++) {
+                var list = d[pts[k]];
+                if (list) for (var i = 0; i < list.length; i++) list[i] = fitPoint(list[i], f);
+            }
+            return d;
+        }
+        return fitPoint(d, f);
+    }
+
+    // Met la spec a l'echelle EN PLACE : la verification apres collage compare alors a ces valeurs.
+    function fitSpec(spec, f) {
+        if (spec.v !== undefined) spec.v = fitData(spec.v, f);
+        if (spec.k) {
+            for (var i = 0; i < spec.k.length; i++) {
+                var k = spec.k[i];
+                k.v = fitData(k.v, f);
+                if (k.is && f.one === undefined) { k.is = fitPoint(k.is, f); k.os = fitPoint(k.os, f); }
+            }
+        }
+    }
+
+    // Valeur simple (nombre, tableau) deja identique dans la cible.
+    function sameAsCurrent(p, v) {
+        if (v !== null && typeof v === "object" && !(v instanceof Array)) return false; // texte, trace, marqueur
+        try { return toJSON(valueOut(p.value, p.propertyValueType)) === toJSON(v); } catch (e) { return false; }
+    }
+
     // quiet : Transform est recopie en entier, ses proprietes 3D cachees sur un calque 2D refusent la valeur.
     function applyProp(p, spec, offset, quiet) {
+        try { var ff = fitFactor(p); if (ff) fitSpec(spec, ff); } catch (eFit) {}
         try {
             if (spec.k && spec.k.length) {
                 applyKeys(p, spec.k, offset);
+            } else if (spec.v !== undefined && spec.q && !spec.li && p.numKeys === 0 && sameAsCurrent(p, spec.v)) {
+                // Reglage recopie par precaution, deja a cette valeur (effet tout juste ajoute, valeurs par defaut) :
+                // pas d'ecriture. Une ecriture fait tout reevaluer a After Effects, c'etait l'essentiel du collage.
             } else if (spec.v !== undefined) {
                 // Time Remap active sans cles : AE en pose deux d'office, il faut les garder.
                 if (p.numKeys > 0 && p.matchName !== "ADBE Time Remapping") { while (p.numKeys > 0) p.removeKey(1); }
@@ -1006,12 +1233,14 @@
                 // Numero de calque : celui du calque recree (l'ordre change au collage), 0 si pas copie.
                 if (spec.li && X.layerRemap && typeof v === "number" && v > 0) {
                     v = X.layerRemap[v] ? X.layerRemap[v].index : 0;
+                    spec.v = v;
                 }
                 p.setValue(v);
                 if (spec.v && spec.v._td) checkText(p, spec.v, p.propertyGroup(p.propertyDepth).name);
             }
         } catch (e) {
-            if (!quiet && !spec.q) warn("value not applied: " + spec.n + " (" + errText(e) + ")");
+            // Propriete cachee par After Effects (Clone Source d'un trait Paint qui ne clone pas...) : rien a poser.
+            if (!quiet && !spec.q && !/hidden/i.test(errText(e))) warn("value not applied: " + spec.n + " (" + errText(e) + ")");
         }
         if (spec.x !== undefined) {
             try { p.expression = spec.x; p.expressionEnabled = spec.xe !== false; } catch (e2) {
@@ -1072,6 +1301,7 @@
                 }
                 idx = findChild(parent, c.m, seen[c.m]);
                 // Introuvable : signale seulement entre memes versions (sinon reglage d'une version plus recente).
+                if (!idx && spec.m === "ADBE Effect Parade") { warn("effect not available in this After Effects (plugin or preset pseudo effect missing): " + c.n); continue; }
                 if (!idx) { if (X.pasteSameVersion && (c.c || c.k || c.x !== undefined || c.v !== undefined)) warn("not found here: " + c.n); continue; }
             }
             var cp = path.concat([idx]);
@@ -1141,7 +1371,10 @@
         }
         try { c.workAreaStart = rec.a.workAreaStart; c.workAreaDuration = rec.a.workAreaDuration; } catch (e2) {}
         try { if (rec.res) c.resolutionFactor = rec.res; } catch (e3) {}
-        buildLayers(c, rec.layers, ctx, null);
+        // Une precomp garde sa taille : ses calques ne s'adaptent pas a la comp cible (Fit).
+        var fit = ctx.fit;
+        ctx.fit = null;
+        try { buildLayers(c, rec.layers, ctx, null); } finally { ctx.fit = fit; }
         if (rec.markers) { try { applyProp(c.markerProperty, rec.markers, 0); } catch (e4) {} }
         return c;
     }
@@ -1187,7 +1420,10 @@
             if (ctx.made[L.src]) {
                 nl = comp.layers.add(ctx.made[L.src]);
             } else {
-                nl = comp.layers.addSolid(rec.color, rec.name, rec.w, rec.h, rec.pa, dur);
+                // Solide ou calque d'effets a la taille de la comp source : a la taille de la comp cible (Fit).
+                var sw = rec.w, sh = rec.h;
+                if (compSized(L, ctx)) { sw = ctx.fit.w; sh = ctx.fit.h; }
+                nl = comp.layers.addSolid(rec.color, rec.name, sw, sh, rec.pa, dur);
                 ctx.made[L.src] = nl.source;
             }
         } else if (L.kind === "comp") {
@@ -1200,6 +1436,22 @@
         }
         try { if (nl.name !== L.name) nl.name = L.name; } catch (e1) {}
         return nl;
+    }
+
+    // Calque copie a la taille de sa comp (solide, calque d'effets) quand le collage s'adapte a la comp cible.
+    function compSized(L, ctx) {
+        if (!ctx.fit || L.kind !== "solid") return false;
+        var r = ctx.pk.items[L.src];
+        return !!r && r.w === ctx.fit.sw && r.h === ctx.fit.sh;
+    }
+
+    function fitFor(layers, q, ctx) {
+        if (!ctx.fit) return null;
+        var L = layers[q], parentL = null;
+        if (L.parent !== undefined) for (var i = 0; i < layers.length; i++) if (layers[i].index === L.parent) parentL = layers[i];
+        // Position dans l'espace de la comp, ou d'un parent lui aussi redimensionne.
+        var pos = L.parent === undefined || (parentL !== null && compSized(parentL, ctx));
+        return { sx: ctx.fit.sx, sy: ctx.fit.sy, pos: pos, layer: compSized(L, ctx), cam: L.kind === "camera" || L.kind === "light" };
     }
 
     // Construit les calques L (ordre du haut vers le bas) dans comp. above : calque au-dessus duquel coller.
@@ -1246,6 +1498,7 @@
                 else rest.push(top);
             }
             ordered.c = ordered.c.concat(rest);
+            X.fitNow = fitFor(layers, q, ctx);
             // Calque 2D : ses options de matiere sont cachees et refusent toute valeur ; on le passe en 3D
             // le temps de les poser (sinon il garde les reglages par defaut du rendu de la comp cible).
             if (material) {
@@ -1260,6 +1513,7 @@
             }
         }
         X.layerRemap = null;
+        X.fitNow = null;
         for (var r = 0; r < layers.length; r++) {
             var L2 = layers[r], nl3 = made[r];
             // Sur un solide, regler l'entree deplace aussi la sortie : la sortie se pose toujours en dernier.
@@ -1286,7 +1540,7 @@
         return made;
     }
 
-    function pasteProps(pk) {
+    function pasteProps(pk, ctx) {
         var comp = targetComp();
         if (!(comp instanceof CompItem) || comp.selectedLayers.length === 0) {
             throw new Error("select the layer(s) to paste the effects / animation onto");
@@ -1302,8 +1556,15 @@
         var targets = comp.selectedLayers;
         for (var t = 0; t < targets.length; t++) {
             var layer = targets[t];
+            var fitProps = ctx.fitWanted && pk.comp && (pk.comp.w !== comp.width || pk.comp.h !== comp.height);
+            var targetSized = false;
+            try { targetSized = layer.source.mainSource instanceof SolidSource && layer.source.width === comp.width && layer.source.height === comp.height; } catch (eTs) {}
             for (var j = 0; j < pk.props.length; j++) {
                 var e = pk.props[j];
+                // Fit : copie de la spec par calque cible (la mise a l'echelle se fait en place).
+                X.fitNow = fitProps ? { sx: comp.width / pk.comp.w, sy: comp.height / pk.comp.h, pos: !layer.parent,
+                    layer: !!e.cs && targetSized, cam: layer instanceof CameraLayer || layer instanceof LightLayer } : null;
+                if (X.fitNow) e = { chain: e.chain, leaf: e.leaf, cs: e.cs, spec: parseJSON(toJSON(e.spec)) };
                 var path = [];
                 var ok = true, created = false;
                 var seen = {};
@@ -1332,6 +1593,7 @@
                 }
             }
         }
+        X.fitNow = null;
         return pk.props.length + " property(ies) on " + targets.length + " layer(s)";
     }
 
@@ -1442,8 +1704,9 @@
             var fs = flatten(src[i].props, "", {}), fg = flatten(got.props, "", {});
             for (var k in fs) {
                 if (!fs.hasOwnProperty(k)) continue;
-                // Reglage de texte inconnu de cette version d'After Effects (AE 2020 face a 2025) : ignore.
-                if (fg[k] === undefined && k.indexOf(" |text.") >= 0) continue;
+                // Reglage inconnu de cette version d'After Effects (texte, Shadow Color... d'AE 2025 colles dans
+                // AE 2020) : ignore.
+                if (fg[k] === undefined && (k.indexOf(" |text.") >= 0 || !sameVersion)) continue;
                 if (fg[k] === undefined) diffs.push(k + ": missing (original " + fs[k].substr(0, 80) + ")");
                 else if (fg[k] !== fs[k]) diffs.push(k + ": " + explainDiff(fs[k], fg[k]));
             }
@@ -1471,11 +1734,19 @@
         var above = null;
         var sel = comp.selectedLayers;
         for (var i = 0; i < sel.length; i++) if (!above || sel[i].index < above.index) above = sel[i];
+        var resized = pk.comp && (pk.comp.w !== comp.width || pk.comp.h !== comp.height);
+        if (resized && ctx.fitWanted) {
+            ctx.fit = { sx: comp.width / pk.comp.w, sy: comp.height / pk.comp.h, w: comp.width, h: comp.height, sw: pk.comp.w, sh: pk.comp.h };
+        }
+        var t0 = new Date().getTime();
         var made = buildLayers(comp, pk.layers, ctx, above);
-        if (pk.comp && (pk.comp.w !== comp.width || pk.comp.h !== comp.height)) {
-            log("source comp " + pk.comp.w + "x" + pk.comp.h + ", target comp " + comp.width + "x" + comp.height + ": positions copied as they are");
+        var t1 = new Date().getTime();
+        if (resized) {
+            log("source comp " + pk.comp.w + "x" + pk.comp.h + ", target comp " + comp.width + "x" + comp.height + ": " +
+                (ctx.fit ? "fitted to the target comp size" : "positions copied as they are"));
         }
         try { verifyLayers(pk.layers, made, pk.ae); } catch (eV) { log("check: " + errText(eV)); }
+        log("paste timing: build " + (t1 - t0) + " ms, check " + (new Date().getTime() - t1) + " ms (" + made.length + " layer(s))");
         for (var s = 1; s <= comp.numLayers; s++) comp.layer(s).selected = false;
         for (var m = 0; m < made.length; m++) { try { made[m].selected = true; } catch (e) {} }
         return made.length + " layer(s) in " + comp.name;
@@ -1523,17 +1794,65 @@
         var pk = fromJSON(readText(X.testClipboard || (X.ROOT + "\\clipboard.json")));
         if (pk.fmt !== "AECopy") throw new Error("unknown clipboard");
         X.pasteSameVersion = String(pk.ae).split(".")[0] === app.version.split(".")[0];
-        var ctx = { pk: pk, made: {}, created: [] };
+        var ctx = { pk: pk, made: {}, created: [], fitWanted: !!(opt && opt.fit) };
         var what;
         app.beginUndoGroup("AECopy paste");
         try {
             if (pk.kind === "comps") what = pasteComps(pk, ctx, opt && opt.nest);
             else if (pk.kind === "layers") what = pasteLayers(pk, ctx);
-            else what = pasteProps(pk);
+            else what = pasteProps(pk, ctx);
         } finally {
+            X.fitNow = null;
             app.endUndoGroup();
         }
         return "ok " + what + " (from " + pk.src + ", AE " + pk.ae + ")";
+    };
+
+    function pad2(v) { return (v < 10 ? "0" : "") + v; }
+
+    // Image copiee ailleurs (navigateur, capture d'ecran...) : AECopy.exe l'a ecrite en PNG dans
+    // mailbox\clipimage_<pid>.png. Elle part dans un dossier qui reste (a cote du projet enregistre,
+    // sinon a cote d'AECopy), est importee dans le dossier « AECopy Pasted » du panneau Projet, et posee
+    // dans la comp ouverte a l'instant courant, au-dessus du calque selectionne.
+    X.doPasteImage = function () {
+        var src = new File(X.ROOT + "\\clipimage_" + X.pid + ".png");
+        if (!src.exists) throw new Error("no image received");
+        var dir = new Folder(app.project.file ? app.project.file.parent.fsName + "\\AECopy Pasted" : X.HOME + "\\Pasted images");
+        if (!dir.exists && !dir.create()) throw new Error("cannot create " + dir.fsName);
+        var d = new Date();
+        var base = "Pasted image " + d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " +
+            pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
+        var dest = new File(dir.fsName + "\\" + base + ".png");
+        for (var n = 2; dest.exists; n++) dest = new File(dir.fsName + "\\" + base + " " + n + ".png");
+        if (!src.copy(dest.fsName)) throw new Error("cannot write " + dest.fsName);
+        src.remove();
+        app.beginUndoGroup("AECopy paste image");
+        try {
+            var item = app.project.importFile(new ImportOptions(dest));
+            var folder = null;
+            for (var i = 1; i <= app.project.rootFolder.numItems; i++) {
+                var it = app.project.rootFolder.item(i);
+                if (it instanceof FolderItem && it.name === "AECopy Pasted") { folder = it; break; }
+            }
+            if (!folder) folder = app.project.items.addFolder("AECopy Pasted");
+            item.parentFolder = folder;
+            var comp = targetComp();
+            if (!comp) {
+                warn("no open composition: image added to the Project panel only");
+                return "ok image " + dest.name;
+            }
+            var above = null;
+            var sel = comp.selectedLayers;
+            for (var s = 0; s < sel.length; s++) if (!above || sel[s].index < above.index) above = sel[s];
+            var lay = comp.layers.add(item);
+            lay.startTime = comp.time;
+            if (above) lay.moveBefore(above);
+            for (var l = 1; l <= comp.numLayers; l++) comp.layer(l).selected = false;
+            lay.selected = true;
+            return "ok image " + dest.name + " in " + comp.name;
+        } finally {
+            app.endUndoGroup();
+        }
     };
 
     // ------------------------------------------------------------------ boite aux lettres
@@ -1541,24 +1860,27 @@
     X.handle = function (line) {
         var parts = line.replace(/^\s+|\s+$/g, "").split(" ");
         var verb = parts[0], id = parts[1];
-        var res;
+        var res, reload = false;
         X.warnings = [];
         try {
             X.readRuns = verb === "copystyles";
             if (verb === "copy" || verb === "copystyles") {
                 // Ctrl+C : on ecrit tout de suite, la tache de cet After Effects peut mourir avant le Ctrl+V.
+                var c0 = new Date().getTime();
                 res = X.doMark();
+                var c1 = new Date().getTime();
                 if (res.indexOf("ok") === 0) res = X.doExport() + " | " + res;
+                log("copy timing: choose " + (c1 - c0) + " ms, read " + (new Date().getTime() - c1) + " ms");
             }
             else if (verb === "mark") res = X.doMark();
             else if (verb === "export") res = X.doExport();
-            else if (verb === "paste") res = X.doPaste();
-            else if (verb === "dragpaste") res = X.doPaste({ nest: true });
-            else if (verb === "ping") res = "ok " + app.version;
+            // ...fit : option « Fit to comp size » de l'appli.
+            else if (verb === "paste" || verb === "pastefit") res = X.doPaste({ fit: verb === "pastefit" });
+            else if (verb === "dragpaste" || verb === "dragpastefit") res = X.doPaste({ nest: true, fit: verb === "dragpastefit" });
+            else if (verb === "pasteimage") res = X.doPasteImage();
+            else if (verb === "ping") res = "ok " + app.version + " " + X.STAMP;
             else if (verb === "stop") {
-                // AECopy quitte : plus de boucle ni de fiche ; il revient au prochain demarrage ou a l'injection.
-                try { app.cancelTask(X.taskId); } catch (eStop) {}
-                X.taskId = 0;
+                // AECopy quitte : plus de fiche ; Reload (ou le prochain demarrage d'After Effects) la remet.
                 X.running = false;
                 try { (new File(X.ROOT + "\\inst_" + X.pid + ".txt")).remove(); } catch (eInst) {}
                 log("stopped by AECopy");
@@ -1566,8 +1888,8 @@
             }
             else if (verb === "reload") {
                 // Recharge ce fichier juste apres la reponse (mise a jour sans redemarrer After Effects).
-                app.scheduleTask("$.global.AECOPY_HOME = \"" + X.HOME.replace(/\\/g, "/") + "\"; $.evalFile(new File(\"" +
-                    (X.HOME + "\\AECopy.jsx").replace(/\\/g, "/") + "\"));", 100, false);
+                // Directement, pas par une tache differee : celle-ci ne se declenchait plus toujours.
+                reload = true;
                 res = "ok reloading";
             }
             else res = "err unknown command: " + verb;
@@ -1580,16 +1902,22 @@
         }
         if (res.indexOf("err") === 0) log(verb + " : " + res);
         try { writeText(X.ROOT + "\\done_" + id + ".txt", res); } catch (e2) { log("reply: " + errText(e2)); }
+        if (reload) {
+            try {
+                $.global.AECOPY_HOME = X.HOME;
+                $.evalFile(new File(X.HOME + "\\AECopy.jsx"));
+            } catch (eReload) { log("reload: " + errText(eReload)); }
+        }
     };
 
-    X.ticks = 0;
+    // Appele par l'extension quand une commande attend.
     X.poll = function () {
         try {
-            if (X.ticks++ % 6 === 0) { try { trackSelection(); } catch (eT) {} } // toutes les 600 ms
             var f = new File(X.ROOT + "\\cmd_" + X.pid + ".txt");
             if (!f.exists) return;
             var s = readText(f.fsName);
-            f.remove();
+            // Pas retiree : l'appli l'a reprise (delai depasse), elle ne doit pas s'executer.
+            if (!f.remove()) return;
             if (s) X.handle(s);
         } catch (e) {
             log("poll : " + errText(e));
@@ -1615,10 +1943,6 @@
         return parseInt(s, 10) || 0;
     };
 
-    X.arm = function () {
-        if (X.taskId) { try { app.cancelTask(X.taskId); } catch (e) {} }
-        X.taskId = app.scheduleTask("$.global.AECOPY.poll()", 100, true);
-    };
 
     X.start = function () {
         ensureFolder(X.ROOT);
@@ -1626,10 +1950,6 @@
         X.pid = X.findPid();
         if (!X.pid) { log("After Effects process id not found"); return false; }
         heartbeat();
-        X.arm();
-        // AE 2020 : une tache repetee posee pendant le demarrage (dossier Startup) ne tourne jamais ;
-        // on la repose une fois l'application prete.
-        app.scheduleTask("$.global.AECOPY.arm()", 3000, false);
         X.running = true;
         log("AECopy " + X.VERSION + " active in After Effects " + app.version);
         return true;
@@ -1638,6 +1958,7 @@
     // Pour les tests (tests\fulltest.jsx).
     X.serLayer = serLayer;
     X.toJSON = toJSON;
+    X.parseJSON = parseJSON;
 
     try { X.start(); } catch (e) { log("start: " + errText(e)); }
 })();

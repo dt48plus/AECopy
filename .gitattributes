@@ -1,0 +1,2 @@
+# GitHub language bar: AECopy.jsx is ExtendScript (counted as JavaScript); show the app (C#) as the main language.
+*.jsx linguist-detectable=false

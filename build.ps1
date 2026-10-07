@@ -1,5 +1,5 @@
 # Author: Ilhan Turan - https://ilhanturan.fr
-# AECopy v1.0.0 - compile AECopy.exe avec son icone (csc du .NET Framework 4, present sur tout Windows).
+# AECopy v1.1.0 - compile AECopy.exe avec son icone (csc du .NET Framework 4, present sur tout Windows).
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
